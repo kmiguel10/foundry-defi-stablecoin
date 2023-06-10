@@ -8,6 +8,7 @@ import {DecentralizedStableCoin} from "../../src/DecentralizedStableCoin.sol";
 import {DSCEngine} from "../../src/DSCEngine.sol";
 import {HelperConfig} from "../../script/HelperConfig.s.sol";
 import {ERC20Mock} from "@openzeppelin/contracts/mocks/ERC20Mock.sol";
+import {MockV3Aggregator} from "../mocks/MockV3Aggregator.sol";
 import {console} from "forge-std/console.sol";
 
 contract DSCEngineTest is Test {
@@ -21,9 +22,11 @@ contract DSCEngineTest is Test {
 
     address public USER = makeAddr("user");
     address public NOT_OWNER_USER = makeAddr("not owner");
+    address public LIQUIDATOR = makeAddr("liquidator");
     uint256 public constant AMOUNT_COLLATERAL = 10 ether;
     uint256 public constant STARTING_ETHER_BALANCE = 10 ether;
-    uint256 public constant AMOUNT_MINT = 100000; //this gives a health factor 100000000000000000e18
+    uint256 public constant AMOUNT_MINT = 100 ether; //this gives a health factor 100000000000000000e18
+    uint256 public constant COLLATERAL_TO_COVER = 20 ether;
 
     event CollateralDeposited(address indexed user, address indexed token, uint256 indexed amount);
     event Transfer(address indexed from, address indexed to, uint256 value);
@@ -261,4 +264,45 @@ contract DSCEngineTest is Test {
      * - after liquidation user has nom more debt
      *
      */
+
+    /**
+     * Create a liquidated modifier
+     */
+    modifier liquidated() {
+        //Create a user with bad health factor
+        vm.startPrank(USER);
+        ERC20Mock(weth).approve(address(dsce), AMOUNT_COLLATERAL);
+        dsce.depositCollateralAndMintDsc(weth, AMOUNT_COLLATERAL, AMOUNT_MINT);
+        vm.stopPrank();
+
+        int256 ethUsdUpdatedPrice = 18e8; // 1 ETH = $18
+
+        MockV3Aggregator(ethUsdPriceFeed).updateAnswer(ethUsdUpdatedPrice);
+        uint256 userHealthFactor = dsce.getHealthFactor(USER);
+        console.log("User health factor: ", userHealthFactor);
+
+        //Mint weth for liquidator to cover debt
+        ERC20Mock(weth).mint(LIQUIDATOR, COLLATERAL_TO_COVER);
+
+        //Liquidator liquidates USER
+        vm.startPrank(LIQUIDATOR);
+        ERC20Mock(weth).approve(address(dsce), COLLATERAL_TO_COVER);
+        dsce.depositCollateralAndMintDsc(weth, COLLATERAL_TO_COVER, AMOUNT_MINT);
+        //Liquidator approves dsce to receive dsc
+        dsc.approve(address(dsce), AMOUNT_MINT);
+        //Liquidator covers entire debt
+        dsce.liquidate(weth, USER, AMOUNT_MINT);
+        vm.stopPrank();
+        _;
+    }
+
+    function testLiquidatorTakesOnUsersDebt() public liquidated {
+        (uint256 liquidatorDscMinted,) = dsce.getAccountInformation(LIQUIDATOR);
+        assertEq(liquidatorDscMinted, AMOUNT_MINT);
+    }
+
+    function testUserHasNoMoreDebt() public liquidated {
+        (uint256 userDscMinted,) = dsce.getAccountInformation(USER);
+        assertEq(userDscMinted, 0);
+    }
 }
